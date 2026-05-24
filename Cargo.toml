@@ -6,7 +6,7 @@ description = "Batteries-included Agent toolbox built on agent-base — MCP mult
 license = "MIT"
 repository = "https://github.com/chenkangzeng1/agent-works"
 readme = "README.md"
-keywords = ["agent", "ai", "llm", "mcp", "skill", "cli", "tool-calling"]
+keywords = ["agent", "ai", "llm", "mcp", "tool-calling"]
 categories = ["development-tools", "asynchronous"]
 
 [features]
