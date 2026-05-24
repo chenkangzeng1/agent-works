@@ -1,5 +1,7 @@
 # agent-works
 
+[![crates.io](https://img.shields.io/crates/v/agent-works.svg)](https://crates.io/crates/agent-works)
+[![Documentation](https://docs.rs/agent-works/badge.svg)](https://docs.rs/agent-works)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **Batteries-included Agent toolbox built on [agent-base](https://github.com/chenkangzeng1/agent-base).**
