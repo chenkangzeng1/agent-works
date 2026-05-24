@@ -1,0 +1,631 @@
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::Mutex;
+
+use agent_works::{
+    AgentBuilder, AgentEvent, AgentResult, ChatMessage, LlmCapabilities, LlmClient,
+    ResponseFormat, RunOutcome, StreamChunk, Tool, ToolContext, ToolControlFlow, ToolOutput,
+};
+use async_trait::async_trait;
+use futures_core::Stream;
+use serde_json::{json, Value};
+
+type ChunkStream = Pin<Box<dyn Stream<Item = AgentResult<StreamChunk>> + Send>>;
+
+struct MockLlmClient {
+    responses: Mutex<std::vec::IntoIter<Vec<StreamChunk>>>,
+    call_count: Mutex<usize>,
+}
+
+impl MockLlmClient {
+    fn new(scripted_responses: Vec<Vec<StreamChunk>>) -> Self {
+        Self {
+            responses: Mutex::new(scripted_responses.into_iter()),
+            call_count: Mutex::new(0),
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        *self.call_count.lock().unwrap()
+    }
+}
+
+#[async_trait]
+impl LlmClient for MockLlmClient {
+    async fn chat(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[Value],
+        _reasoning: Option<&agent_works::ReasoningConfig>,
+        _response_format: Option<&ResponseFormat>,
+    ) -> AgentResult<Value> {
+        unimplemented!()
+    }
+
+    async fn chat_stream(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[Value],
+        _reasoning: Option<&agent_works::ReasoningConfig>,
+        _response_format: Option<&ResponseFormat>,
+    ) -> AgentResult<ChunkStream> {
+        *self.call_count.lock().unwrap() += 1;
+        let chunks: Vec<AgentResult<StreamChunk>> = self
+            .responses
+            .lock()
+            .unwrap()
+            .next()
+            .unwrap_or_default()
+            .into_iter()
+            .map(Ok)
+            .collect();
+        let stream = futures_util::stream::iter(chunks);
+        Ok(Box::pin(stream))
+    }
+
+    fn capabilities(&self) -> LlmCapabilities {
+        LlmCapabilities {
+            supports_streaming: true,
+            supports_tools: true,
+            supports_vision: false,
+            supports_thinking: false,
+            max_context_tokens: None,
+            max_output_tokens: None,
+        }
+    }
+}
+
+struct EchoTool;
+
+#[async_trait]
+impl Tool for EchoTool {
+    fn name(&self) -> &'static str {
+        "echo"
+    }
+
+    fn definition(&self) -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": "echo",
+                "description": "echo back the message",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "message": { "type": "string" }
+                    },
+                    "required": ["message"]
+                }
+            }
+        })
+    }
+
+    async fn call(&self, args: &Value, _ctx: &ToolContext) -> AgentResult<ToolOutput> {
+        let msg = args["message"].as_str().unwrap_or("");
+        Ok(ToolOutput {
+            summary: format!("echo: {msg}"),
+            raw: Some(json!({ "echo": msg })),
+            control_flow: ToolControlFlow::Continue,
+            truncation: None,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Builder forwarding tests (without skill feature)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_builder_forwarding_text_reply() {
+    let llm = Arc::new(MockLlmClient::new(vec![vec![
+        StreamChunk::Text("Hello, world!".to_string()),
+        StreamChunk::Stop,
+    ]]));
+
+    let runtime = AgentBuilder::new(llm.clone())
+        .system_prompt("You are a helpful assistant")
+        .build()
+        .unwrap();
+
+    let session_id = runtime.create_session().await;
+    let result = runtime.run_turn_stream(session_id.clone(), "Hi").await;
+    assert!(result.is_ok(), "Expected ok, got: {result:?}");
+    let (_events, outcome) = result.unwrap();
+    assert_eq!(outcome, RunOutcome::Completed);
+    assert_eq!(llm.call_count(), 1);
+}
+
+#[tokio::test]
+async fn test_builder_forwarding_with_tool() {
+    let llm = Arc::new(MockLlmClient::new(vec![
+        vec![
+            StreamChunk::ToolCall(json!({
+                "delta": {
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {
+                            "name": "echo",
+                            "arguments": "{\"message\": \"hello\"}"
+                        }
+                    }]
+                }
+            })),
+            StreamChunk::Stop,
+        ],
+        vec![StreamChunk::Text("Done!".to_string()), StreamChunk::Stop],
+    ]));
+
+    let runtime = AgentBuilder::new(llm.clone())
+        .register_tool(EchoTool)
+        .build()
+        .unwrap();
+
+    let session_id = runtime.create_session().await;
+    let result = runtime.run_turn_stream(session_id, "Echo hello").await;
+    assert!(result.is_ok(), "Expected ok, got: {result:?}");
+    assert_eq!(llm.call_count(), 2);
+}
+
+#[tokio::test]
+async fn test_builder_forwarding_middleware() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let triggered = Arc::new(AtomicBool::new(false));
+
+    struct FlagMiddleware {
+        flag: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl agent_works::Middleware for FlagMiddleware {
+        async fn on_post_llm(
+            &self,
+            _ctx: &mut agent_works::PostLlmCtx,
+        ) -> AgentResult<()> {
+            self.flag.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let llm = Arc::new(MockLlmClient::new(vec![vec![
+        StreamChunk::Text("reply".to_string()),
+        StreamChunk::Stop,
+    ]]));
+
+    let runtime = AgentBuilder::new(llm)
+        .system_prompt("sys")
+        .middleware(FlagMiddleware {
+            flag: triggered.clone(),
+        })
+        .build()
+        .unwrap();
+
+    let session_id = runtime.create_session().await;
+    let result = runtime.run_turn_stream(session_id, "test").await;
+    assert!(result.is_ok());
+    assert!(triggered.load(Ordering::SeqCst), "Middleware should be triggered");
+}
+
+// ---------------------------------------------------------------------------
+// Builder forwarding - error recovery
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_builder_forwarding_error_recovery() {
+    let llm = Arc::new(MockLlmClient::new(vec![vec![
+        StreamChunk::ToolCall(json!({
+            "delta": {
+                "tool_calls": [{
+                    "id": "call_1",
+                    "function": {
+                        "name": "echo",
+                        "arguments": "{\"message\": \"test\"}"
+                    }
+                }]
+            }
+        })),
+        StreamChunk::Stop,
+    ]]));
+
+    let runtime = AgentBuilder::new(llm)
+        .register_tool(EchoTool)
+        .tool_timeout(30_000)
+        .max_tool_output_chars(4096)
+        .language(agent_works::Language::Zh)
+        .build()
+        .unwrap();
+
+    let session_id = runtime.create_session().await;
+    let result = runtime.run_turn_stream(session_id, "test").await;
+    assert!(result.is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// ToolEnforcementMiddleware tests (in agent-base, re-exported by agent-works)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+    async fn test_tool_enforcement_available_via_works() {
+        let llm = Arc::new(MockLlmClient::new(vec![vec![
+            StreamChunk::Text("I will do it...".to_string()),
+            StreamChunk::Stop,
+        ]]));
+
+        let config = agent_works::ToolEnforcementConfig::default();
+        let runtime = AgentBuilder::new(llm)
+            .register_tool(EchoTool)
+            .system_prompt("sys")
+            .middleware(agent_works::ToolEnforcementMiddleware::new(config))
+            .build()
+            .unwrap();
+
+        let session_id = runtime.create_session().await;
+        let result = runtime.run_turn_stream(session_id, "do something").await;
+        assert!(result.is_ok(), "Expected ok: {result:?}");
+    }
+
+// ---------------------------------------------------------------------------
+// Skill feature tests
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "skill")]
+mod skill_tests {
+    use super::*;
+    use agent_works::skill::{LazySkillPrompter, Skill, SkillPrompter};
+    use std::sync::Arc;
+    use serde_json::Value;
+
+    struct AddTool;
+
+    #[async_trait]
+    impl Tool for AddTool {
+        fn name(&self) -> &'static str {
+            "add"
+        }
+
+        fn definition(&self) -> Value {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "add",
+                    "description": "Calculate the sum of two integers",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "a": { "type": "integer", "description": "First addend" },
+                            "b": { "type": "integer", "description": "Second addend" }
+                        },
+                        "required": ["a", "b"]
+                    }
+                }
+            })
+        }
+
+        async fn call(&self, args: &Value, _ctx: &ToolContext) -> AgentResult<ToolOutput> {
+            let a = args["a"].as_i64().unwrap_or(0);
+            let b = args["b"].as_i64().unwrap_or(0);
+            Ok(ToolOutput {
+                summary: format!("{a} + {b} = {}", a + b),
+                raw: Some(json!({ "result": a + b })),
+                control_flow: ToolControlFlow::Break,
+                truncation: None,
+            })
+        }
+    }
+
+    struct MathSkill;
+
+    impl Skill for MathSkill {
+        fn name(&self) -> &'static str {
+            "math"
+        }
+
+        fn brief_description(&self) -> String {
+            "Math: supports addition".to_string()
+        }
+
+        fn detailed_description(&self) -> String {
+            "## Math Skill\n\n- **add**: Calculate the sum of two integers".to_string()
+        }
+
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![Arc::new(AddTool)]
+        }
+    }
+
+    #[tokio::test]
+    async fn test_register_skill_with_builder() {
+        let llm = Arc::new(super::MockLlmClient::new(vec![vec![
+            StreamChunk::ToolCall(json!({
+                "delta": {
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {
+                            "name": "add",
+                            "arguments": "{\"a\": 1, \"b\": 2}"
+                        }
+                    }]
+                }
+            })),
+            StreamChunk::Stop,
+        ]]));
+
+        let runtime = AgentBuilder::new(llm)
+            .system_prompt("You are a math assistant")
+            .register_skill(MathSkill)
+            .build()
+            .unwrap();
+
+        let session_id = runtime.create_session().await;
+        let result = runtime.run_turn_stream(session_id, "1+2=?").await;
+        assert!(result.is_ok(), "Expected ok, got: {result:?}");
+
+        let (events, _outcome) = result.unwrap();
+        let tool_done = events.iter().any(|e| {
+            matches!(e, AgentEvent::ToolCallFinished { tool_name, .. } if tool_name == "add")
+        });
+        assert!(tool_done, "add tool should be called");
+    }
+
+    #[tokio::test]
+    async fn test_skill_disable_prompt_injection() {
+        let llm = Arc::new(super::MockLlmClient::new(vec![vec![
+            StreamChunk::ToolCall(json!({
+                "delta": {
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {
+                            "name": "add",
+                            "arguments": "{\"a\": 3, \"b\": 4}"
+                        }
+                    }]
+                }
+            })),
+            StreamChunk::Stop,
+        ]]));
+
+        let runtime = AgentBuilder::new(llm)
+            .system_prompt("My custom prompt")
+            .register_skill(MathSkill)
+            .disable_skill_prompt_injection()
+            .build()
+            .unwrap();
+
+        let session_id = runtime.create_session().await;
+        let result = runtime.run_turn_stream(session_id, "3+4=?").await;
+        assert!(result.is_ok(), "Expected ok, got: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_skill_custom_detail_tool_name() {
+        let llm = Arc::new(super::MockLlmClient::new(vec![vec![
+            StreamChunk::ToolCall(json!({
+                "delta": {
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {
+                            "name": "skill_info",
+                            "arguments": "{\"name\": \"math\"}"
+                        }
+                    }]
+                }
+            })),
+            StreamChunk::Stop,
+        ]]));
+
+        let runtime = AgentBuilder::new(llm)
+            .system_prompt("sys")
+            .register_skill(MathSkill)
+            .skill_detail_tool_name("skill_info")
+            .build()
+            .unwrap();
+
+        let session_id = runtime.create_session().await;
+        let result = runtime.run_turn_stream(session_id, "tell me about math skill").await;
+        assert!(result.is_ok(), "Expected ok, got: {result:?}");
+
+        let (events, _outcome) = result.unwrap();
+        let skill_loaded = events.iter().any(|e| {
+            matches!(e, AgentEvent::ToolCallFinished { tool_name, summary, .. }
+                if tool_name == "skill_info" && summary.contains("Math Skill"))
+        });
+        assert!(skill_loaded, "skill_info tool should return Math Skill detail");
+    }
+
+    #[tokio::test]
+    async fn test_skill_tool_name_conflict() {
+        let llm = Arc::new(super::MockLlmClient::new(vec![]));
+
+        let result = AgentBuilder::new(llm)
+            .register_tool(AddTool) // registers "add" directly
+            .register_skill(MathSkill) // MathSkill also registers "add"
+            .build();
+
+        assert!(result.is_err(), "Tool name conflict should be detected");
+        let err_msg = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("Expected error"),
+        };
+        assert!(
+            err_msg.contains("Tool name conflict"),
+            "Error should mention tool name conflict: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_lazy_skill_prompter() {
+        let skills: Vec<Arc<dyn Skill>> = vec![Arc::new(MathSkill)];
+        let prompter = LazySkillPrompter::new();
+        let prompt = prompter.build_prompt(&skills);
+        assert!(prompt.contains("math"), "Prompt should contain skill name");
+        assert!(prompt.contains("get_skill_detail"), "Prompt should contain instruction");
+    }
+
+    #[test]
+    fn test_lazy_skill_prompter_custom_config() {
+        let skills: Vec<Arc<dyn Skill>> = vec![Arc::new(MathSkill)];
+        let prompter = LazySkillPrompter::new()
+            .title("## My Skills")
+            .instruction("> Use my_get_detail to see details")
+            .item_prefix("+ ");
+        let prompt = prompter.build_prompt(&skills);
+        assert!(prompt.contains("## My Skills"));
+        assert!(prompt.contains("my_get_detail"));
+        assert!(prompt.contains("+ "));
+    }
+
+    #[test]
+    fn test_full_detail_prompter() {
+        let skills: Vec<Arc<dyn Skill>> = vec![Arc::new(MathSkill)];
+        let prompter = agent_works::skill::FullDetailPrompter;
+        let prompt = prompter.build_prompt(&skills);
+        assert!(prompt.contains("math"), "Should contain skill name");
+        assert!(prompt.contains("Math Skill"), "Should contain detailed description");
+    }
+
+    #[test]
+    fn test_skill_default_methods() {
+        assert_eq!(MathSkill.version(), "0.1.0");
+        assert!(MathSkill.tags().is_empty());
+        assert_eq!(MathSkill.author(), "");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Builtin tools tests
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "builtin-tools")]
+mod builtin_tests {
+    use super::*;
+    use agent_works::builtin::*;
+    use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn test_read_file_builtin() {
+        let tool = ReadFileTool {
+            workspace: PathBuf::from("."),
+        };
+        assert_eq!(tool.name(), "read_file");
+
+        let def = tool.definition();
+        let func = def.get("function").unwrap();
+        assert_eq!(func.get("name").unwrap().as_str().unwrap(), "read_file");
+    }
+
+    #[tokio::test]
+    async fn test_write_file_builtin() {
+        let tool = WriteFileTool {
+            workspace: PathBuf::from("."),
+        };
+        assert_eq!(tool.name(), "write_file");
+    }
+
+    #[tokio::test]
+    async fn test_list_directory_builtin() {
+        let tool = ListDirectoryTool {
+            workspace: PathBuf::from("."),
+        };
+        assert_eq!(tool.name(), "list_directory");
+    }
+
+    #[tokio::test]
+    async fn test_file_exists_builtin() {
+        let tool = FileExistsTool {
+            workspace: PathBuf::from("."),
+        };
+        assert_eq!(tool.name(), "file_exists");
+    }
+
+    #[tokio::test]
+    async fn test_search_replace_builtin() {
+        let tool = SearchReplaceTool {
+            workspace: PathBuf::from("."),
+        };
+        assert_eq!(tool.name(), "search_replace");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MCP module tests
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "mcp")]
+mod mcp_tests {
+    use super::*;
+    use agent_works::mcp::*;
+
+    #[test]
+    fn test_mcp_tool_info_creation() {
+        let info = McpToolInfo {
+            name: "test_tool".to_string(),
+            description: "A test tool".to_string(),
+            input_schema: json!({"type": "object"}),
+        };
+        assert_eq!(info.name, "test_tool");
+        assert_eq!(info.description, "A test tool");
+    }
+
+    #[test]
+    fn test_mcp_transport_variants() {
+        let http = McpTransport::Http {
+            url: "http://localhost:8080".to_string(),
+        };
+        assert!(matches!(http, McpTransport::Http { .. }));
+
+        let stdio = McpTransport::Stdio {
+            command: "npx".to_string(),
+            args: vec!["-y".to_string(), "mcp-server".to_string()],
+        };
+        assert!(matches!(stdio, McpTransport::Stdio { .. }));
+    }
+
+    #[test]
+    fn test_mcp_server_config() {
+        let config = McpServerConfig {
+            name: "my-server".to_string(),
+            transport: McpTransport::Http {
+                url: "http://localhost:8080".to_string(),
+            },
+            auto_reconnect: true,
+        };
+        assert_eq!(config.name, "my-server");
+        assert!(config.auto_reconnect);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Skill detail tool standalone tests
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "skill")]
+#[tokio::test]
+async fn test_skill_detail_tool_standalone() {
+    use agent_works::skill::{Skill, SkillDetailTool};
+    use std::sync::Arc;
+
+    struct SimpleSkill;
+    impl Skill for SimpleSkill {
+        fn name(&self) -> &'static str {
+            "simple"
+        }
+        fn brief_description(&self) -> String {
+            "A simple skill".to_string()
+        }
+        fn detailed_description(&self) -> String {
+            "Detailed info about simple skill".to_string()
+        }
+        fn tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![]
+        }
+    }
+
+    let skills: Vec<Arc<dyn Skill>> = vec![Arc::new(SimpleSkill)];
+    let detail_tool = SkillDetailTool::new(skills, "get_skill_detail".to_string());
+
+    assert_eq!(detail_tool.name(), "get_skill_detail");
+
+    let def = detail_tool.definition();
+    let func = def.get("function").unwrap();
+    assert_eq!(func.get("name").unwrap().as_str().unwrap(), "get_skill_detail");
+}
