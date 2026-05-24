@@ -1,6 +1,6 @@
 [package]
 name = "agent-works"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Batteries-included Agent toolbox built on agent-base — MCP multi-server, Skills, built-in file tools, CLI REPL"
 license = "MIT"
@@ -18,7 +18,7 @@ cli = []
 full = ["mcp", "skill", "builtin-tools", "cli"]
 
 [dependencies]
-agent-base = "0.1.1"
+agent-base = "0.1.2"
 async-trait = "0.1.89"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
