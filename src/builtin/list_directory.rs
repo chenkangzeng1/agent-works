@@ -39,13 +39,18 @@ impl Tool for ListDirectoryTool {
         let path = args["path"].as_str().unwrap_or(".");
         let full_path = self.workspace.join(path);
 
+        tracing::debug!(path = %path, "list directory start");
         let mut entries = tokio::fs::read_dir(&full_path)
             .await
-            .map_err(|e| AgentError::internal(format!("failed to read dir {}: {e}", full_path.display())))?;
+            .map_err(|e| {
+                tracing::error!(path = %path, error = %e, "list directory failed");
+                AgentError::internal(format!("failed to read dir {}: {e}", full_path.display()))
+            })?;
 
         let mut items: Vec<Value> = Vec::new();
         loop {
             let entry = entries.next_entry().await.map_err(|e| {
+                tracing::error!(path = %path, error = %e, "list directory failed");
                 AgentError::internal(format!("failed to read entry: {e}"))
             })?;
             let Some(entry) = entry else {

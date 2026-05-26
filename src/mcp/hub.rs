@@ -70,8 +70,9 @@ impl McpHub {
                 }
                 Err(e) => {
                     warn!(
-                        "failed to discover tools from {}: {e}",
-                        entry.config.name
+                        server_name = %entry.config.name,
+                        error = %e,
+                        "failed to discover tools from MCP server"
                     );
                     entry.state = ConnectionState::Failed(format!("{e}"));
                 }
@@ -96,7 +97,7 @@ impl McpHub {
         for entry in &mut self.servers {
             entry.client = None;
             entry.state = ConnectionState::Disconnected;
-            info!("disconnected from MCP server: {}", entry.config.name);
+            info!(server_name = %entry.config.name, "disconnected from MCP server");
         }
     }
 
@@ -108,10 +109,10 @@ impl McpHub {
             };
             match client.list_tools().await {
                 Ok(_) => {
-                    info!("health check passed: {}", entry.config.name);
+                    info!(server_name = %entry.config.name, "health check passed");
                 }
                 Err(e) => {
-                    warn!("health check failed for {}: {e}", entry.config.name);
+                    warn!(server_name = %entry.config.name, error = %e, "health check failed");
                 }
             }
         }

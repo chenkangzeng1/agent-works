@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use tracing;
 
 use agent_base::{AgentError, AgentResult, Tool, ToolContext, ToolControlFlow, ToolOutput};
 
@@ -42,10 +43,15 @@ impl Tool for ReadFileTool {
 
         let full_path = self.workspace.join(path);
 
+        tracing::debug!(path = %path, "read file start");
         let content = tokio::fs::read_to_string(&full_path)
             .await
-            .map_err(|e| AgentError::internal(format!("failed to read {}: {e}", full_path.display())))?;
+            .map_err(|e| {
+                tracing::error!(path = %path, error = %e, "read file failed");
+                AgentError::internal(format!("failed to read {}: {e}", full_path.display()))
+            })?;
 
+        tracing::info!(path = %path, size = content.len(), "read file success");
         Ok(ToolOutput {
             summary: content.clone(),
             raw: Some(json!({"path": path, "content": content})),

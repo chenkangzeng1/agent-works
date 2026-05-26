@@ -3,6 +3,7 @@ use std::sync::Arc;
 use agent_base::{AgentEvent, AgentResult, Tool, ToolContext, ToolControlFlow, ToolOutput};
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use tracing;
 
 use super::Skill;
 
@@ -72,6 +73,7 @@ impl Tool for SkillDetailTool {
             .find(|s| s.name() == name)
             .map(|s| s.detailed_description());
 
+        tracing::debug!("skill detail queried");
         let _ = ctx.event_bus.send(AgentEvent::Custom {
             session_id: ctx.session_id.clone(),
             payload: json!({

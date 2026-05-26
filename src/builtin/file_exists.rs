@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use tracing;
 
 use agent_base::{AgentError, AgentResult, Tool, ToolContext, ToolControlFlow, ToolOutput};
 
@@ -52,6 +53,7 @@ impl Tool for FileExistsTool {
             .as_ref()
             .is_ok_and(|m| m.is_dir());
 
+        tracing::trace!(path = %path, exists = exists, "file exists check");
         Ok(ToolOutput {
             summary: if exists {
                 format!("{} exists", path)

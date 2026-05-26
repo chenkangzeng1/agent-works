@@ -71,6 +71,7 @@ pub struct FullDetailPrompter;
 
 impl SkillPrompter for FullDetailPrompter {
     fn build_prompt(&self, skills: &[Arc<dyn Skill>]) -> String {
+        tracing::debug!("skill prompt generated");
         if skills.is_empty() {
             return String::new();
         }

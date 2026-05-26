@@ -50,16 +50,21 @@ impl Tool for WriteFileTool {
 
         let full_path = self.workspace.join(path);
 
+        tracing::debug!(path = %path, "write file start");
+
         if let Some(parent) = full_path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                tracing::error!(path = %path, error = %e, "write file failed");
                 AgentError::internal(format!("failed to create directory {}: {e}", parent.display()))
             })?;
         }
 
         tokio::fs::write(&full_path, content).await.map_err(|e| {
+            tracing::error!(path = %path, error = %e, "write file failed");
             AgentError::internal(format!("failed to write {}: {e}", full_path.display()))
         })?;
 
+        tracing::info!(path = %path, "write file success");
         Ok(ToolOutput {
             summary: format!("Successfully wrote to {}", path),
             raw: Some(json!({"path": path, "written": true})),
